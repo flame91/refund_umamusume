@@ -5,7 +5,7 @@ class Driver {
 
     init_driver = async (dirname) => {
         const driver = await pt.launch({
-            headless: true,
+            headless: false,
             args: [
                 "--window-size=1920,1080",
                 "--disable-notifications",

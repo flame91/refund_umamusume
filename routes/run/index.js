@@ -10,6 +10,9 @@ const ua = require("../common/user-agent.js");
 const sleep = require("sleep-promise");
 const readline = require("readline");
 
+const db_r = require("../db/models/query_exec_rdb");
+const qy_r = require("../db/query/query_rdb");
+
 const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -22,47 +25,64 @@ let cnt_listener = 1,
     func = {},
     page_obj = {};
 
+let last = ".page_end";
+let list = ".us-post";
+let cur_page;
+
 const area = {
-    bible: "#lnb > li:nth-child(1) > ul > li > a",
-    last: ".frst_last:not(.this)",
-    no: ".bd_lst_wrp>table>tbody>tr>.no",
-    title: ".bd_lst_wrp>table>tbody>tr>.title",
-    title_a: ".bd_lst_wrp>table>tbody>tr>.title>a",
-    content: ".xe_content",
+    no: ".gall_num",
+    title: ".gall_tit>a:not(.reply_numbox)",
+    writer: ".gall_writer",
+    reg_date: ".gall_date",
+    url: ".gall_tit>a",
 };
 
-const url_home = "https://nocr.net/korbible";
+const url_home =
+    "https://gall.dcinside.com/mgallery/board/lists/?id=umamusu&sort_type=N&search_head=160";
 
 //-------------------------------------------------------------------------------
 //-------------------------------- Main Function --------------------------------
 //-------------------------------------------------------------------------------
 func.main = () => {
     return new Promise(async (resolve, reject) => {
-        await func.chk_folder("성경");
+        // 마지막 페이지 클릭하여 이동
+        let page = await func.get_page(await func.get_driver("list"), "list");
+        await page
+            .goto(url_home, {
+                waitUntil: ["networkidle0", "domcontentloaded"],
+            })
+            .catch((err) => {
+                console.log(
+                    `[우마무스메 환불 크롤러 ${name}] ${url_home} 이동 중 에러`
+                );
+                return reject(err);
+            });
 
-        let arr_url_page = await func.crawl_list("list");
-        let last_page = await func.create_page(arr_url_page);
+        await page.click(last);
 
-        for (let i = 0; i < last_page; i++) {
-            func.crawl_page(
-                `${arr_url_page[0]}?page=${Number(i) + 1}`,
-                page_obj[i],
-                i + 1
-            );
+        while (true) {
+            cur_page = await page.url().split("&")[1].split("=")[1];
+            if (cur_page > 2) cur_page = 2;
+            await func.crawl_list(page);
+            await sleep(30000);
+
+            if (cur_page > 1) {
+                await page.goto(
+                    `https://gall.dcinside.com/mgallery/board/lists/?id=umamusu&page=${
+                        cur_page - 1
+                    }&search_head=160`,
+                    {
+                        waitUntil: ["networkidle0", "domcontentloaded"],
+                    }
+                );
+            } else {
+                await page.goto(url_home, {
+                    waitUntil: ["networkidle0", "domcontentloaded"],
+                });
+            }
         }
-
-        return resolve(true);
     }); // Promise
 }; // func.main()
-
-func.chk_folder = (dir_name) => {
-    return new Promise(async (resolve, reject) => {
-        if (!fs.existsSync(dir_name)) {
-            fs.mkdirSync(dir_name);
-        }
-        return resolve(true);
-    }); // Promise
-};
 
 func.get_driver = (name) => {
     return new Promise(async (resolve, reject) => {
@@ -85,124 +105,77 @@ func.get_page = (driver, name) => {
     });
 };
 
-func.crawl_list = async (name) => {
+func.crawl_list = async (page) => {
     return new Promise(async (resolve, reject) => {
-        let page = await func.get_page(await func.get_driver(name));
-        await page.setViewport({ width: 1920, height: 1080 });
+        await page.waitForSelector(list);
+        const list_article = await page.$$(list);
 
-        await page
-            .goto(url_home, {
-                waitUntil: ["networkidle0", "domcontentloaded"],
-            })
-            .catch((err) => {
-                console.log(`[성경 ${name}] ${url_home} 이동 중 에러`);
-                return reject(err);
-            });
+        const len = list_article.length;
+        for (let i = len - 1; i >= 0; i--) {
+            let obj = {};
+            for (let j in area) {
+                if (j == "url") {
+                    obj[j] = await list_article[i].$eval(
+                        area[j],
+                        (el) => el.href
+                    );
+                } else {
+                    obj[j] = await list_article[i].$eval(
+                        area[j],
+                        (el) => el.innerText
+                    );
+                }
+                obj[j] = obj[j].replaceAll("'", "&#039;");
+            }
 
-        // 성경 리스트 읽어와서 보여주기
-        await page.waitForSelector(area["bible"]);
-        let list_bible = await page.$$(area["bible"]);
-        for (let i in list_bible) {
-            let curTxt = await page.evaluate(
-                (el) => el.innerText,
-                list_bible[i]
-            );
-            console.log(`${Number(i) + 1}. ${curTxt}`);
+            if ((await func.chk_registered(obj["no"])) == false) {
+                obj["vendor"] =
+                    obj["title"].includes("애플") ^
+                    obj["title"].includes("구글")
+                        ? obj["title"].includes("애플")
+                            ? "apple"
+                            : "google"
+                        : null;
+                let amount = obj["title"].replace(/[^0-9]/g, "");
+                obj["amount"] =
+                    amount.length < 5 || amount.length > 8 || amount == ""
+                        ? 0
+                        : amount;
+                await func.insert_article(obj);
+            } else continue;
         }
-
-        // 원하는 성경 입력 & URL 리턴
-        let url_target;
-        rl.question("받고 싶은 성경을 입력해주세요 [숫자]: ", async (num) => {
-            rl.close();
-            url_target = await page.evaluate((el) => {
-                return el.href;
-            }, list_bible[num - 1]);
-            return resolve([url_target, page]);
-        });
+        return resolve();
     });
 };
 
-func.create_page = ([url_target, page]) => {
+func.chk_registered = async (no) => {
     return new Promise(async (resolve, reject) => {
-        await page
-            .goto(url_target, {
-                waitUntil: ["networkidle0", "domcontentloaded"],
-            })
-            .catch((err) => {
-                console.log(`[func.crawl_page() ${url_target} 이동 중 에러`);
-                return reject(err);
-            });
+        const result = await db_r.select(
+            models.main,
+            qy_r.select_registered(no)
+        );
+        return resolve(result[0]["cnt"] > 0);
+    });
+};
 
-        await page.waitForSelector(area["last"]);
-        let last_page = await page.evaluate(
-            (el) => el.innerText,
-            await page.$(area["last"])
+func.insert_article = async (obj) => {
+    return new Promise(async (resolve, reject) => {
+        const qInsertArticle = qy_r.insert_article(
+            obj["vendor"],
+            obj["amount"],
+            obj["no"],
+            obj["title"],
+            obj["writer"],
+            obj["reg_date"],
+            obj["url"]
         );
 
-        cnt_listener += Number(last_page);
-        process.setMaxListeners(cnt_listener);
-        for (let i = 0; i < last_page; i++) {
-            page_obj[i] = await func.get_page(await func.get_driver(i), i);
-        }
-        return resolve(last_page);
-    });
-};
+        await db_r.insert(models.main, qInsertArticle).catch((err) => {
+            console.log(`[insert_scrap()] qInsertArticle 에러\n${err}`);
+            return reject(err);
+        });
 
-func.crawl_page = (url_page, page, num) => {
-    return new Promise(async (resolve, reject) => {
-        let arr_no = [],
-            arr_title = [],
-            arr_url = [];
-
-        await page
-            .goto(url_page, {
-                waitUntil: ["networkidle0", "domcontentloaded"],
-            })
-            .catch((err) => {
-                console.log(`[func.crawl_page() ${url_page} 이동 중 에러`);
-                return reject(err);
-            });
-
-        let elems = await page.$$(area["no"]);
-        for (let r of elems)
-            arr_no.push(await (await r.getProperty("innerText")).jsonValue());
-
-        elems = await page.$$(area["title"]);
-        for (let r of elems)
-            arr_title.push(
-                await (await r.getProperty("innerText")).jsonValue()
-            );
-
-        elems = await page.$$(area["title_a"]);
-        for (let r of elems)
-            arr_url.push(await (await r.getProperty("href")).jsonValue());
-
-        for (let i in arr_url) {
-            await page
-                .goto(arr_url[i], {
-                    waitUntil: ["networkidle0", "domcontentloaded"],
-                })
-                .catch((err) => {
-                    console.log(
-                        `[func.crawl_page() ${arr_url[i]} 이동 중 에러`
-                    );
-                    return reject(err);
-                });
-
-            let content = await (
-                await (await page.$(area["content"])).getProperty("innerText")
-            ).jsonValue();
-
-            console.log(`[${num}] ${arr_title[i]}.txt 쓰는 중`);
-            fs.writeFileSync(`./성경/${arr_title[i]}.txt`, content, (err) => {
-                if (err) {
-                    console.log(`${arr_title[i]} 파일 쓰기중 실패`);
-                    return reject(err);
-                }
-                //file written successfully
-            });
-        }
-        return resolve(true);
+        return resolve();
     });
 };
 
